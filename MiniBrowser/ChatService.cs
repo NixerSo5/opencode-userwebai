@@ -34,6 +34,30 @@ public partial class Form1
         return false;
       }
 
+      function gemRead(root) {
+        var out = '';
+        function walk(n) {
+          if (n.nodeType === 3) { out += n.nodeValue; return; }
+          if (n.nodeType !== 1) return;
+          var tag = n.tagName;
+          if (tag === 'CODE-BLOCK' || tag === 'PRE') {
+            var codeEl = n.querySelector('code') || n;
+            var code = (codeEl.innerText || '').replace(/[\s\u00a0]+$/, '');
+            var isTool = /^\s*\{/.test(code) && /"name"\s*:/.test(code) && /"arguments"\s*:/.test(code);
+            if (out && out.charAt(out.length - 1) !== '\n') out += '\n';
+            out += '```' + (isTool ? 'tool_call' : '') + '\n' + code + '\n```\n';
+            return;
+          }
+          if (tag === 'BR') { out += '\n'; return; }
+          var kids = n.childNodes;
+          for (var i = 0; i < kids.length; i++) walk(kids[i]);
+          if (/^(P|DIV|LI|UL|OL|H[1-6]|TABLE|TR|BLOCKQUOTE|RESPONSE-ELEMENT|MESSAGE-CONTENT)$/.test(tag)) out += '\n';
+        }
+        var cs = root.childNodes;
+        for (var i = 0; i < cs.length; i++) walk(cs[i]);
+        return out.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+      }
+
       function captureResponse(resp, url) {
         try {
           var clone = resp.clone();
@@ -193,16 +217,13 @@ public partial class Form1
             if (mrs.length) {
               var last = mrs[mrs.length - 1];
               var mds = last.querySelectorAll('.markdown');
-              if (mds.length) {
-                var gt = (mds[mds.length - 1].innerText || '').trim();
-                if (gt) return gt;
-              }
+              if (mds.length) return gemRead(mds[mds.length - 1]);
               var rt = last.querySelector('.model-response-text') ||
                        last.querySelector('message-content');
-              return rt ? (rt.innerText || '').trim() : '';
+              return rt ? gemRead(rt) : '';
             }
             var allmd = document.querySelectorAll('.markdown');
-            if (allmd.length) return (allmd[allmd.length - 1].innerText || '').trim();
+            if (allmd.length) return gemRead(allmd[allmd.length - 1]);
             return '';
           }
           var els = document.querySelectorAll('[data-message-author-role="assistant"]');
