@@ -275,13 +275,14 @@ public partial class Form1
 
     private const string FallbackEmptyMessage = "（网页端未返回内容，可能触发限流或页面未就绪，请稍后重试）";
 
+    private const string LimitReachedText = "达到对话长度上限";
+    private const string StartNewChatText = "请开启新对话";
+    private const string NewConversationUrl = "https://chat.deepseek.com/";
+    private const int MaxNewSessionRetries = 2;
+
     private static readonly Regex ToolCallFenceRegex = new(
         """```tool_call\s*(?<json>[\s\S]*?)```""",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-    private static readonly Regex AnyFenceRegex = new(
-        """```[A-Za-z0-9_+-]*\s*(?<json>[\s\S]*?)```""",
-        RegexOptions.Compiled);
 
     private sealed class ToolCallResult
     {
@@ -453,8 +454,9 @@ public partial class Form1
                 }
 
                 var raw = await ChatAsync(req.Prompt);
-                var toolCalls = ExtractToolCalls(raw, req.Tools);
-                var content = RemoveToolCallBlocks(raw);
+                var consumed = new List<string>();
+                var toolCalls = ExtractToolCalls(raw, req.Tools, consumed);
+                var content = RemoveToolCallBlocks(raw, consumed);
                 if (toolCalls.Count == 0 && string.IsNullOrWhiteSpace(content))
                 {
                     content = FallbackEmptyMessage;
@@ -508,6 +510,47 @@ public partial class Form1
             if (method == "GET" && path == "/debug/last")
             {
                 await WriteJsonAsync(res, 200, new { ok = true, capture = _lastCapture });
+                return;
+            }
+
+            if (method == "POST" && path == "/debug/extract")
+            {
+                using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
+                var bodyText = await reader.ReadToEndAsync();
+                var extractContent = bodyText;
+                var toolDefs = new List<ToolDef>();
+                try
+                {
+                    using var doc = JsonDocument.Parse(bodyText);
+                    if (doc.RootElement.TryGetProperty("content", out var c) && c.ValueKind == JsonValueKind.String)
+                        extractContent = c.GetString() ?? "";
+                    if (doc.RootElement.TryGetProperty("tools", out var ts) && ts.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var t in ts.EnumerateArray())
+                        {
+                            var name = t.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+                            var desc = t.TryGetProperty("description", out var d) ? d.GetString() ?? "" : "";
+                            var parms = t.TryGetProperty("parameters", out var p)
+                                ? (p.ValueKind == JsonValueKind.String ? p.GetString() ?? "{}" : p.GetRawText())
+                                : "{}";
+                            if (name.Length > 0)
+                                toolDefs.Add(new ToolDef { Name = name, Description = desc, ParametersJson = parms });
+                        }
+                    }
+                }
+                catch (JsonException)
+                {
+                }
+
+                var used = new List<string>();
+                var extracted = ExtractToolCalls(extractContent, toolDefs, used);
+                await WriteJsonAsync(res, 200, new
+                {
+                    ok = true,
+                    count = extracted.Count,
+                    calls = extracted.Select(x => new { name = x.Name, arguments = x.ArgumentsJson }).ToList(),
+                    content = RemoveToolCallBlocks(extractContent, used),
+                });
                 return;
             }
 
@@ -565,13 +608,42 @@ public partial class Form1
         await _sendLock.WaitAsync();
         try
         {
-            var wait = MinSendInterval - (DateTime.UtcNow - _lastSendAt);
-            if (wait > TimeSpan.Zero) await Task.Delay(wait);
-            _lastSendAt = DateTime.UtcNow;
+            for (var attempt = 0; ; attempt++)
+            {
+                var raw = await SendOnceAsync(prompt);
 
-            var tcs = new TaskCompletionSource<CompletionMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
-            _pendingCompletion = tcs;
+                var limited = IsConversationLimit(raw);
+                if (!limited && string.IsNullOrWhiteSpace(raw) && IsDeepSeekPage())
+                {
+                    limited = await PageContainsAsync(LimitReachedText) ||
+                              await PageContainsAsync(StartNewChatText);
+                }
 
+                if (!limited || attempt >= MaxNewSessionRetries || !IsDeepSeekPage())
+                {
+                    return raw;
+                }
+
+                await StartNewConversationAsync();
+            }
+        }
+        finally
+        {
+            _pendingCompletion = null;
+            _sendLock.Release();
+        }
+    }
+
+    private async Task<string> SendOnceAsync(string prompt)
+    {
+        var wait = MinSendInterval - (DateTime.UtcNow - _lastSendAt);
+        if (wait > TimeSpan.Zero) await Task.Delay(wait);
+        _lastSendAt = DateTime.UtcNow;
+
+        var tcs = new TaskCompletionSource<CompletionMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingCompletion = tcs;
+        try
+        {
             var insertStatus = await OnUiAsync(async () => JsonSerializer.Deserialize<string>(
                 await webView.ExecuteScriptAsync(
                     "window.__minibrowser_send(" + JsonSerializer.Serialize(prompt) + ")")));
@@ -613,8 +685,39 @@ public partial class Form1
         finally
         {
             _pendingCompletion = null;
-            _sendLock.Release();
         }
+    }
+
+    private async Task StartNewConversationAsync()
+    {
+        await OnUiAsync(() =>
+        {
+            webView.CoreWebView2.Navigate(NewConversationUrl);
+            return Task.CompletedTask;
+        });
+
+        for (var i = 0; i < 80; i++)
+        {
+            await Task.Delay(500);
+            var ready = await OnUiAsync(async () =>
+                await webView.ExecuteScriptAsync("!!document.querySelector('textarea')"));
+            if (ready == "true") return;
+        }
+    }
+
+    private async Task<bool> PageContainsAsync(string marker)
+    {
+        var json = await OnUiAsync(async () => await webView.ExecuteScriptAsync(
+            "!!(document.body && document.body.innerText && document.body.innerText.indexOf(" +
+            JsonSerializer.Serialize(marker) + ") !== -1)"));
+        return json == "true";
+    }
+
+    private static bool IsConversationLimit(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return false;
+        return text.Contains(LimitReachedText, StringComparison.Ordinal) ||
+               text.Contains(StartNewChatText, StringComparison.Ordinal);
     }
 
     private bool IsChatGptPage()
@@ -622,6 +725,13 @@ public partial class Form1
         var url = _currentUrl;
         return url.Contains("chatgpt.com", StringComparison.OrdinalIgnoreCase) ||
                url.Contains("chat.openai.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsDeepSeekPage()
+    {
+        var url = _currentUrl;
+        return !string.IsNullOrEmpty(url) &&
+               url.Contains("chat.deepseek.com", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool IsGeminiPage()
@@ -938,43 +1048,106 @@ public partial class Form1
         return sb.ToString().Trim();
     }
 
-    private static List<ToolCallResult> ExtractToolCalls(string content, IReadOnlyList<ToolDef> tools)
+    private static List<ToolCallResult> ExtractToolCalls(
+        string content, IReadOnlyList<ToolDef> tools, List<string>? consumed = null)
     {
         var calls = new List<ToolCallResult>();
         if (string.IsNullOrEmpty(content)) return calls;
 
-        var knownTools = tools.Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
+        var knownTools = tools.Count > 0
+            ? new HashSet<string>(tools.Select(t => t.Name), StringComparer.Ordinal)
+            : null;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        foreach (Match m in ToolCallFenceRegex.Matches(content))
+        foreach (var obj in ScanJsonObjects(content))
         {
-            ParseToolCallJson(m.Groups["json"].Value, null, tools, calls);
-        }
-
-        if (calls.Count > 0) return calls;
-
-        if (knownTools.Count > 0)
-        {
-            foreach (Match m in AnyFenceRegex.Matches(content))
+            var before = calls.Count;
+            try
             {
-                ParseToolCallJson(m.Groups["json"].Value, knownTools, tools, calls);
+                using var doc = JsonDocument.Parse(
+                    obj,
+                    new JsonDocumentOptions
+                    {
+                        CommentHandling = JsonCommentHandling.Skip,
+                        AllowTrailingCommas = true,
+                    });
+                CollectToolCalls(doc.RootElement, knownTools, tools, calls);
             }
+            catch (JsonException)
+            {
+            }
+
+            if (calls.Count == before) continue;
+            for (var i = calls.Count - 1; i >= before; i--)
+            {
+                var key = calls[i].Name + " " + calls[i].ArgumentsJson;
+                if (seen.Add(key)) continue;
+                calls.RemoveAt(i);
+            }
+            consumed?.Add(obj);
         }
 
         return calls;
     }
 
-    private static void ParseToolCallJson(
-        string? json, HashSet<string>? knownTools, IReadOnlyList<ToolDef> tools, List<ToolCallResult> output)
+    private static IEnumerable<string> ScanJsonObjects(string text)
     {
-        if (string.IsNullOrWhiteSpace(json)) return;
+        var n = text.Length;
+        var i = 0;
+        while (i < n)
+        {
+            if (text[i] != '{')
+            {
+                i++;
+                continue;
+            }
 
-        try
-        {
-            using var doc = JsonDocument.Parse(json.Trim());
-            CollectToolCalls(doc.RootElement, knownTools, tools, output);
-        }
-        catch (JsonException)
-        {
+            var start = i;
+            var depth = 0;
+            var inString = false;
+            var escaped = false;
+            var end = -1;
+
+            for (var j = start; j < n; j++)
+            {
+                var c = text[j];
+                if (inString)
+                {
+                    if (escaped)
+                    {
+                        escaped = false;
+                        continue;
+                    }
+                    if (c == '\\')
+                    {
+                        escaped = true;
+                        continue;
+                    }
+                    if (c == '"') inString = false;
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inString = true;
+                }
+                else if (c == '{')
+                {
+                    depth++;
+                }
+                else if (c == '}')
+                {
+                    if (--depth == 0)
+                    {
+                        end = j + 1;
+                        break;
+                    }
+                }
+            }
+
+            if (end < 0) yield break;
+            yield return text[start..end];
+            i = end;
         }
     }
 
@@ -998,6 +1171,13 @@ public partial class Form1
         }
 
         var name = GetString(el, "name") ?? GetString(el, "tool") ?? GetString(el, "tool_name");
+
+        if (string.IsNullOrWhiteSpace(name) &&
+            el.TryGetProperty("function", out var fn) && fn.ValueKind == JsonValueKind.Object)
+        {
+            CollectToolCalls(fn, knownTools, tools, output);
+            return;
+        }
 
         var argsJson = "{}";
         var hasArgsWrapper = false;
@@ -1030,11 +1210,19 @@ public partial class Form1
     private static string? InferToolName(JsonElement? argsObject, IReadOnlyList<ToolDef> tools)
     {
         if (tools.Count == 0) return null;
-        if (tools.Count == 1) return tools[0].Name;
-        if (argsObject is not { ValueKind: JsonValueKind.Object }) return null;
 
         var keys = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var p in argsObject.Value.EnumerateObject()) keys.Add(p.Name);
+        if (argsObject is { ValueKind: JsonValueKind.Object })
+        {
+            foreach (var p in argsObject.Value.EnumerateObject()) keys.Add(p.Name);
+        }
+
+        if (tools.Count == 1)
+        {
+            var props = GetSchemaPropertyNames(tools[0].ParametersJson);
+            return props.Count == 0 || keys.IsSubsetOf(props) ? tools[0].Name : null;
+        }
+
         if (keys.Count == 0) return null;
 
         string? matched = null;
@@ -1068,10 +1256,15 @@ public partial class Form1
         return names;
     }
 
-    private static string RemoveToolCallBlocks(string content)
+    private static string RemoveToolCallBlocks(string content, List<string>? consumed = null)
     {
         if (string.IsNullOrEmpty(content)) return string.Empty;
-        return ToolCallFenceRegex.Replace(content, string.Empty).Trim();
+        var result = ToolCallFenceRegex.Replace(content, string.Empty);
+        if (consumed != null)
+        {
+            foreach (var obj in consumed) result = result.Replace(obj, string.Empty);
+        }
+        return result.Trim();
     }
 
     private static string? GetString(JsonElement el, string prop)
