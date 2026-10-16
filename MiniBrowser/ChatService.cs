@@ -453,8 +453,7 @@ public partial class Form1
                 }
 
                 var raw = await ChatAsync(req.Prompt);
-                var knownTools = req.Tools.Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
-                var toolCalls = ExtractToolCalls(raw, knownTools);
+                var toolCalls = ExtractToolCalls(raw, req.Tools);
                 var content = RemoveToolCallBlocks(raw);
                 if (toolCalls.Count == 0 && string.IsNullOrWhiteSpace(content))
                 {
@@ -854,7 +853,11 @@ public partial class Form1
                                              tc.TryGetProperty("function", out var f) ? f : tc;
                                     var name = GetString(fn, "name") ?? "?";
                                     var args = GetString(fn, "arguments") ?? "{}";
-                                    req.HistoryLines.Add("[assistant 调用工具] " + name + " " + args);
+                                    var a = args.TrimStart();
+                                    var rendered = a.StartsWith("{") || a.StartsWith("[")
+                                        ? "{\"name\":\"" + name + "\",\"arguments\":" + args + "}"
+                                        : name + " " + args;
+                                    req.HistoryLines.Add("[assistant 调用工具] " + rendered);
                                 }
                             }
                             var ac = MessageContent(m);
@@ -935,14 +938,16 @@ public partial class Form1
         return sb.ToString().Trim();
     }
 
-    private static List<ToolCallResult> ExtractToolCalls(string content, HashSet<string> knownTools)
+    private static List<ToolCallResult> ExtractToolCalls(string content, IReadOnlyList<ToolDef> tools)
     {
         var calls = new List<ToolCallResult>();
         if (string.IsNullOrEmpty(content)) return calls;
 
+        var knownTools = tools.Select(t => t.Name).ToHashSet(StringComparer.Ordinal);
+
         foreach (Match m in ToolCallFenceRegex.Matches(content))
         {
-            ParseToolCallJson(m.Groups["json"].Value, null, calls);
+            ParseToolCallJson(m.Groups["json"].Value, null, tools, calls);
         }
 
         if (calls.Count > 0) return calls;
@@ -951,34 +956,36 @@ public partial class Form1
         {
             foreach (Match m in AnyFenceRegex.Matches(content))
             {
-                ParseToolCallJson(m.Groups["json"].Value, knownTools, calls);
+                ParseToolCallJson(m.Groups["json"].Value, knownTools, tools, calls);
             }
         }
 
         return calls;
     }
 
-    private static void ParseToolCallJson(string? json, HashSet<string>? knownTools, List<ToolCallResult> output)
+    private static void ParseToolCallJson(
+        string? json, HashSet<string>? knownTools, IReadOnlyList<ToolDef> tools, List<ToolCallResult> output)
     {
         if (string.IsNullOrWhiteSpace(json)) return;
 
         try
         {
             using var doc = JsonDocument.Parse(json.Trim());
-            CollectToolCalls(doc.RootElement, knownTools, output);
+            CollectToolCalls(doc.RootElement, knownTools, tools, output);
         }
         catch (JsonException)
         {
         }
     }
 
-    private static void CollectToolCalls(JsonElement el, HashSet<string>? knownTools, List<ToolCallResult> output)
+    private static void CollectToolCalls(
+        JsonElement el, HashSet<string>? knownTools, IReadOnlyList<ToolDef> tools, List<ToolCallResult> output)
     {
         if (el.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in el.EnumerateArray())
             {
-                CollectToolCalls(item, knownTools, output);
+                CollectToolCalls(item, knownTools, tools, output);
             }
             return;
         }
@@ -986,18 +993,18 @@ public partial class Form1
 
         if (el.TryGetProperty("tool_calls", out var tcs) && tcs.ValueKind == JsonValueKind.Array)
         {
-            CollectToolCalls(tcs, knownTools, output);
+            CollectToolCalls(tcs, knownTools, tools, output);
             return;
         }
 
         var name = GetString(el, "name") ?? GetString(el, "tool") ?? GetString(el, "tool_name");
-        if (string.IsNullOrWhiteSpace(name)) return;
-        if (knownTools is { Count: > 0 } && !knownTools.Contains(name)) return;
 
         var argsJson = "{}";
+        var hasArgsWrapper = false;
         foreach (var key in new[] { "arguments", "args", "parameters" })
         {
             if (!el.TryGetProperty(key, out var argsEl)) continue;
+            hasArgsWrapper = true;
             argsJson = argsEl.ValueKind == JsonValueKind.String
                 ? (argsEl.GetString() ?? "{}")
                 : argsEl.ValueKind is JsonValueKind.Object or JsonValueKind.Array
@@ -1006,7 +1013,59 @@ public partial class Form1
             break;
         }
 
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = InferToolName(hasArgsWrapper ? null : el, tools);
+            if (string.IsNullOrWhiteSpace(name)) return;
+            if (!hasArgsWrapper) argsJson = el.GetRawText();
+        }
+        else if (knownTools is { Count: > 0 } && !knownTools.Contains(name))
+        {
+            return;
+        }
+
         output.Add(new ToolCallResult { Name = name, ArgumentsJson = argsJson });
+    }
+
+    private static string? InferToolName(JsonElement? argsObject, IReadOnlyList<ToolDef> tools)
+    {
+        if (tools.Count == 0) return null;
+        if (tools.Count == 1) return tools[0].Name;
+        if (argsObject is not { ValueKind: JsonValueKind.Object }) return null;
+
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var p in argsObject.Value.EnumerateObject()) keys.Add(p.Name);
+        if (keys.Count == 0) return null;
+
+        string? matched = null;
+        foreach (var t in tools)
+        {
+            var props = GetSchemaPropertyNames(t.ParametersJson);
+            if (props.Count == 0 || !keys.IsSubsetOf(props)) continue;
+            if (matched is not null && matched != t.Name) return null;
+            matched = t.Name;
+        }
+        return matched;
+    }
+
+    private static HashSet<string> GetSchemaPropertyNames(string parametersJson)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        if (string.IsNullOrWhiteSpace(parametersJson)) return names;
+        try
+        {
+            using var doc = JsonDocument.Parse(parametersJson);
+            if (doc.RootElement.ValueKind == JsonValueKind.Object &&
+                doc.RootElement.TryGetProperty("properties", out var props) &&
+                props.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var p in props.EnumerateObject()) names.Add(p.Name);
+            }
+        }
+        catch (JsonException)
+        {
+        }
+        return names;
     }
 
     private static string RemoveToolCallBlocks(string content)
