@@ -13,6 +13,7 @@ public partial class Form1 : Form
     {
         ("DeepSeek", "https://chat.deepseek.com/"),
         ("ChatGPT", "https://chatgpt.com/"),
+        ("Gemini", "https://gemini.google.com/"),
     };
     private const int MaxBase64Chars = 8 * 1024;
 

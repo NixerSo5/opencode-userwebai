@@ -95,6 +95,7 @@ public partial class Form1
           var ed = document.querySelector('#mobile-composer-prompt') ||
                    document.querySelector('#prompt-textarea') ||
                    document.querySelector('#chat-input') ||
+                   document.querySelector('.ql-editor[contenteditable="true"]') ||
                    document.querySelector('textarea[name="prompt"]') ||
                    document.querySelector('div[contenteditable="true"]') ||
                    document.querySelector('textarea');
@@ -119,6 +120,31 @@ public partial class Form1
 
       window.__minibrowser_click_send = function () {
         try {
+          if (location.host.indexOf('gemini.google.com') !== -1) {
+            var ged = document.querySelector('.ql-editor[contenteditable="true"]') ||
+                      document.querySelector('div[contenteditable="true"]') ||
+                      document.querySelector('rich-textarea');
+            if (!ged) return 'no-editor';
+            ged.focus();
+            var ticks = 0;
+            var timer = setInterval(function () {
+              ticks++;
+              var ed2 = document.querySelector('.ql-editor[contenteditable="true"]') || ged;
+              if (!ed2 || !(ed2.innerText || '').trim()) { clearInterval(timer); return; }
+              var sb = document.querySelector('button[aria-label="发送"]') ||
+                       document.querySelector('button[aria-label="Send message"]') ||
+                       document.querySelector('button[aria-label="Send"]');
+              if ((sb && !sb.disabled) || ticks >= 8) {
+                clearInterval(timer);
+                ed2.focus();
+                ed2.dispatchEvent(new KeyboardEvent('keydown', {
+                  key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                  bubbles: true, cancelable: true
+                }));
+              }
+            }, 250);
+            return 'gemini-enter';
+          }
           var selectors = [
             'button[data-testid="send-button"]',
             'button[data-testid="fruitjuice-send-button"]',
@@ -147,8 +173,38 @@ public partial class Form1
         } catch (e) { return 'error:' + e; }
       };
 
+      window.__minibrowser_pending_text = function () {
+        try {
+          var ed = document.querySelector('#mobile-composer-prompt') ||
+                   document.querySelector('#prompt-textarea') ||
+                   document.querySelector('#chat-input') ||
+                   document.querySelector('.ql-editor[contenteditable="true"]') ||
+                   document.querySelector('div[contenteditable="true"]') ||
+                   document.querySelector('textarea');
+          if (!ed) return '';
+          return ((ed.innerText || ed.value || '') + '').trim();
+        } catch (e) { return ''; }
+      };
+
       window.__minibrowser_read_answer = function () {
         try {
+          if (location.host.indexOf('gemini.google.com') !== -1) {
+            var mrs = document.querySelectorAll('model-response');
+            if (mrs.length) {
+              var last = mrs[mrs.length - 1];
+              var mds = last.querySelectorAll('.markdown');
+              if (mds.length) {
+                var gt = (mds[mds.length - 1].innerText || '').trim();
+                if (gt) return gt;
+              }
+              var rt = last.querySelector('.model-response-text') ||
+                       last.querySelector('message-content');
+              return rt ? (rt.innerText || '').trim() : '';
+            }
+            var allmd = document.querySelectorAll('.markdown');
+            if (allmd.length) return (allmd[allmd.length - 1].innerText || '').trim();
+            return '';
+          }
           var els = document.querySelectorAll('[data-message-author-role="assistant"]');
           if (els.length) return (els[els.length - 1].innerText || '').trim();
           var turns = document.querySelectorAll('article[data-testid^="conversation-turn"]');
@@ -177,10 +233,13 @@ public partial class Form1
       window.__minibrowser_watch_answer = function () {
         if (window.__mb_watching) return 'watching';
         window.__mb_watching = true;
+        var isGem = location.host.indexOf('gemini.google.com') !== -1;
+        var baseline = document.querySelectorAll('model-response').length;
         var last = '', stable = 0, ticks = 0;
         var iv = setInterval(function () {
           ticks++;
-          var t = window.__minibrowser_read_answer();
+          var ready = !isGem || document.querySelectorAll('model-response').length > baseline;
+          var t = ready ? window.__minibrowser_read_answer() : '';
           if (t && t === last) stable++; else { stable = 0; last = t; }
           if ((stable >= 4 && last) || ticks > 120) {
             clearInterval(iv);
@@ -500,13 +559,13 @@ public partial class Form1
             if (insertStatus is not ("inserted" or "textarea-ok"))
             {
                 throw new InvalidOperationException(
-                    "无法写入输入框（" + insertStatus + "），请确认当前页面是 chat.deepseek.com 或 chatgpt.com 且已登录");
+                    "无法写入输入框（" + insertStatus + "），请确认当前页面是 chat.deepseek.com、chatgpt.com 或 gemini.google.com 且已登录");
             }
 
             await OnUiAsync(async () =>
                 await webView.ExecuteScriptAsync("window.__minibrowser_click_send()"));
 
-            if (IsChatGptPage())
+            if (IsChatGptPage() || IsGeminiPage())
             {
                 await OnUiAsync(async () =>
                     await webView.ExecuteScriptAsync("window.__minibrowser_watch_answer()"));
@@ -514,13 +573,18 @@ public partial class Form1
 
             if (await Task.WhenAny(tcs.Task, Task.Delay(6000)) != tcs.Task)
             {
-                await OnUiAsync(async () =>
+                var pending = await OnUiAsync(async () => JsonSerializer.Deserialize<string>(
+                    await webView.ExecuteScriptAsync("window.__minibrowser_pending_text()")));
+                if (!string.IsNullOrWhiteSpace(pending))
                 {
-                    await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
-                        "Input.dispatchKeyEvent", EnterKeyDownJson);
-                    await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
-                        "Input.dispatchKeyEvent", EnterKeyUpJson);
-                });
+                    await OnUiAsync(async () =>
+                    {
+                        await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
+                            "Input.dispatchKeyEvent", EnterKeyDownJson);
+                        await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
+                            "Input.dispatchKeyEvent", EnterKeyUpJson);
+                    });
+                }
             }
 
             var message = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(120));
@@ -538,6 +602,11 @@ public partial class Form1
         var url = _currentUrl;
         return url.Contains("chatgpt.com", StringComparison.OrdinalIgnoreCase) ||
                url.Contains("chat.openai.com", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsGeminiPage()
+    {
+        return _currentUrl.Contains("gemini.google.com", StringComparison.OrdinalIgnoreCase);
     }
 
     private Task<T> OnUiAsync<T>(Func<Task<T>> work)

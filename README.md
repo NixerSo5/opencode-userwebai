@@ -41,6 +41,7 @@ Supported pages / 支持的网页：
 | --- | --- | --- |
 | DeepSeek | `https://chat.deepseek.com/` | SSE capture, tool calls supported |
 | ChatGPT | `https://chatgpt.com/` | captured from the page DOM |
+| Gemini | `https://gemini.google.com/` | captured from the page DOM (sign in required) |
 
 ### Requirements
 
@@ -59,7 +60,7 @@ dotnet build -c Release ".\MiniBrowser\MiniBrowser.csproj"
 ```
 
 On startup the app opens `https://chat.deepseek.com/`. Use the site drop-down in
-the toolbar and click **跳转 (Jump)** to switch between DeepSeek and ChatGPT.
+the toolbar and click **跳转 (Jump)** to switch between DeepSeek, ChatGPT and Gemini.
 Log in on the page you want to use.
 
 ### Install the opencode config
@@ -114,8 +115,10 @@ flow\
 
 - The service drives the page that is currently open; use the drop-down to pick
   the site before calling the model.
-- ChatGPT's anonymous mobile-web stream is not directly capturable, so its answer
-  is read from the page DOM. Prefer DeepSeek for tool-calling workflows.
+- ChatGPT's anonymous mobile-web stream and Gemini's responses are not directly
+  capturable, so their answers are read from the page DOM. Prefer DeepSeek for
+  tool-calling workflows.
+- Gemini requires a signed-in Google account; it does not work in guest mode.
 - Requests are serialized (one conversation at a time) with a small throttle to
   avoid rate limiting.
 - Tool calling is implemented as a text-bridging prompt for DeepSeek and is
@@ -152,6 +155,7 @@ flow\
 | --- | --- | --- |
 | DeepSeek | `https://chat.deepseek.com/` | 抓取 SSE，支持工具调用 |
 | ChatGPT | `https://chatgpt.com/` | 从页面 DOM 读取回答 |
+| Gemini | `https://gemini.google.com/` | 从页面 DOM 读取回答（需登录） |
 
 ### 环境要求
 
@@ -170,7 +174,7 @@ dotnet build -c Release ".\MiniBrowser\MiniBrowser.csproj"
 ```
 
 启动后默认打开 `https://chat.deepseek.com/`。用工具栏的下拉框选择站点，点击
-**跳转** 即可在 DeepSeek 与 ChatGPT 之间切换，并在对应网页登录。
+**跳转** 即可在 DeepSeek、ChatGPT 与 Gemini 之间切换，并在对应网页登录。
 
 ### 写入 opencode 配置
 
@@ -221,7 +225,8 @@ flow\
 ### 说明与限制
 
 - 服务驱动的是「当前打开的页面」，调用模型前请先用下拉框选好站点。
-- ChatGPT 匿名移动版（unauth-mweb）的流无法直接抓取，其回答从页面 DOM 读取；
-  需要工具调用时建议使用 DeepSeek。
+- ChatGPT 匿名移动版（unauth-mweb）与 Gemini 的流无法直接抓取，二者回答均从
+  页面 DOM 读取；需要工具调用时建议使用 DeepSeek。
+- Gemini 需要登录 Google 账号，游客模式下不可用。
 - 请求串行处理（同一时间一条对话），并带有轻微节流以避免限流。
 - 工具调用对 DeepSeek 采用文本桥接（prompt 约定 + 解析），属启发式方案。
