@@ -1,0 +1,25 @@
+{
+  "provider": {
+    "webai": {
+      "name": "opencode-WEB-MIX",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:8787/v1",
+        "apiKey": "local-webview-forwarder"
+      },
+      "models": {
+        "opencode-WEB-MIX": {
+          "name": "opencode-WEB-MIX",
+          "tool_call": true,
+          "attachment": false,
+          "reasoning": false,
+          "temperature": false,
+          "limit": {
+            "context": 65536,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}

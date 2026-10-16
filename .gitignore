@@ -1,0 +1,20 @@
+# Build output
+bin/
+obj/
+
+# WebView2 user data (login profile, cache)
+*.WebView2/
+EBWebView/
+
+# Rider / VS
+.vs/
+.idea/
+*.user
+
+# Logs
+*.log
+request-log.jsonl
+
+# OS
+Thumbs.db
+.DS_Store
