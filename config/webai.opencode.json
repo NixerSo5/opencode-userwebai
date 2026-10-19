@@ -11,7 +11,7 @@
         "opencode-WEB-MIX": {
           "name": "opencode-WEB-MIX",
           "tool_call": true,
-          "attachment": false,
+          "attachment": true,
           "reasoning": false,
           "temperature": false,
           "limit": {
