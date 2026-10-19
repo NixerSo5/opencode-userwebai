@@ -1,6 +1,8 @@
 # Build output
 bin/
 obj/
+publish/
+Output/
 
 # WebView2 user data (login profile, cache)
 *.WebView2/
