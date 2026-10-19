@@ -16,6 +16,13 @@ public partial class Form1
     private const string EnterKeyUpJson =
         """{"type":"keyUp","windowsVirtualKeyCode":13,"nativeVirtualKeyCode":13,"key":"Enter","code":"Enter"}""";
 
+    // modifiers: 1=Alt 2=Ctrl 4=Meta 8=Shift；Ctrl+V 走真实剪贴板粘贴（trusted 事件）
+    private const string CtrlVKeyDownJson =
+        """{"type":"rawKeyDown","windowsVirtualKeyCode":86,"nativeVirtualKeyCode":86,"key":"v","code":"KeyV","modifiers":2}""";
+
+    private const string CtrlVKeyUpJson =
+        """{"type":"keyUp","windowsVirtualKeyCode":86,"nativeVirtualKeyCode":86,"key":"v","code":"KeyV","modifiers":2}""";
+
     private const string InjectedScript = """
     (function () {
       if (window.__minibrowser_hooked) return;
@@ -25,6 +32,17 @@ public partial class Form1
         try { window.chrome && window.chrome.webview && window.chrome.webview.postMessage(JSON.stringify(obj)); } catch (e) {}
       }
 
+      // capture 阶段监听真实 paste：页面里收到带文件的粘贴就计数（验证剪贴板 Ctrl+V 是否生效）
+      window.__mb_paste_files = 0;
+      try {
+        document.addEventListener('paste', function (e) {
+          try {
+            var fs = e.clipboardData && e.clipboardData.files;
+            if (fs && fs.length > 0) window.__mb_paste_files += fs.length;
+          } catch (err) {}
+        }, true);
+      } catch (e0) {}
+
       function isCompletionUrl(u) {
         if (!u || typeof u !== 'string') return false;
         if (u.indexOf('/api/v0/chat/completion') !== -1) return true;
@@ -32,6 +50,22 @@ public partial class Form1
         if (u.indexOf('/backend-api/conversation') !== -1) return true;
         if (u.indexOf('/conversation/updates') !== -1) return true;
         return false;
+      }
+
+      function isUploadUrl(u) {
+        if (!u || typeof u !== 'string') return false;
+        if (u.indexOf('upload') !== -1) return true;
+        if (u.indexOf('/backend-api/files') !== -1) return true;
+        if (u.indexOf('files.deepseeksvc.com') !== -1) return true;
+        return false;
+      }
+
+      function uploadBegin() {
+        window.__mb_upload_seen = (window.__mb_upload_seen || 0) + 1;
+        window.__mb_upload_active = (window.__mb_upload_active || 0) + 1;
+      }
+      function uploadEnd() {
+        window.__mb_upload_active = Math.max(0, (window.__mb_upload_active || 1) - 1);
       }
 
       function gemRead(root) {
@@ -89,6 +123,13 @@ public partial class Form1
         try { url = (typeof input === 'string') ? input : (input && input.url) || ''; } catch (e) {}
         var p = origFetch.apply(this, arguments);
         try {
+          if (isUploadUrl(url)) {
+            uploadBegin();
+            var fin = function () { uploadEnd(); };
+            p.then(fin, fin);
+          }
+        } catch (e) {}
+        try {
           if (isCompletionUrl(url)) {
             window.__minibrowser_seen = (window.__minibrowser_seen || 0) + 1;
             p.then(function (resp) { captureResponse(resp, url); });
@@ -102,6 +143,13 @@ public partial class Form1
       XMLHttpRequest.prototype.open = function (m, u) { try { this.__mb_url = u; } catch (e) {} return origOpen.apply(this, arguments); };
       XMLHttpRequest.prototype.send = function (body) {
         var xhr = this;
+        try {
+          if (isUploadUrl(xhr.__mb_url)) {
+            uploadBegin();
+            var fin = function () { uploadEnd(); };
+            xhr.addEventListener('loadend', fin);
+          }
+        } catch (e) {}
         try {
           if (isCompletionUrl(xhr.__mb_url)) {
             window.__minibrowser_seen = (window.__minibrowser_seen || 0) + 1;
@@ -139,6 +187,83 @@ public partial class Form1
           sel.addRange(range);
           var ok = document.execCommand('insertText', false, text);
           return ok ? 'inserted' : 'insert-failed';
+        } catch (e) { return 'error:' + e; }
+      };
+
+      window.__minibrowser_focus_editor = function () {
+        try {
+          var ed = document.querySelector('#mobile-composer-prompt') ||
+                   document.querySelector('#prompt-textarea') ||
+                   document.querySelector('#chat-input') ||
+                   document.querySelector('.ql-editor[contenteditable="true"]') ||
+                   document.querySelector('textarea[name="prompt"]') ||
+                   document.querySelector('div[contenteditable="true"]') ||
+                   document.querySelector('textarea');
+          if (!ed) return 'no-editor';
+          ed.focus();
+          if (ed.tagName !== 'TEXTAREA' && ed.tagName !== 'INPUT') {
+            var sel = window.getSelection();
+            var range = document.createRange();
+            range.selectNodeContents(ed);
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+          return 'focused';
+        } catch (e) { return 'error:' + e; }
+      };
+
+      window.__minibrowser_upload_state = function () {
+        return {
+          seen: window.__mb_upload_seen || 0,
+          active: window.__mb_upload_active || 0,
+          pasted: window.__mb_paste_files || 0
+        };
+      };
+
+      window.__minibrowser_upload_reset = function () {
+        window.__mb_upload_seen = 0;
+        window.__mb_upload_active = 0;
+        window.__mb_paste_files = 0;
+        return 'ok';
+      };
+
+      // 合成 paste 回退（isTrusted=false，部分站点不认，优先用剪贴板+Ctrl+V）
+      window.__minibrowser_paste_images = function (images) {
+        try {
+          var ed = document.querySelector('#mobile-composer-prompt') ||
+                   document.querySelector('#prompt-textarea') ||
+                   document.querySelector('#chat-input') ||
+                   document.querySelector('.ql-editor[contenteditable="true"]') ||
+                   document.querySelector('textarea[name="prompt"]') ||
+                   document.querySelector('div[contenteditable="true"]') ||
+                   document.querySelector('textarea');
+          if (!ed) return 'no-editor';
+          ed.focus();
+          if (!images || images.length === 0) return 'no-images';
+          for (var i = 0; i < images.length; i++) {
+            try {
+              var img = images[i];
+              var dataUrl = img.dataUrl || img.url || img;
+              if (!dataUrl) continue;
+              var mime = img.mimeType || (dataUrl.match(/^data:(.*?);/) || [])[1] || 'image/png';
+              var base64 = dataUrl.indexOf('base64,') !== -1 ? dataUrl.split('base64,')[1] : dataUrl;
+              var byteStr = atob(base64);
+              var ab = new ArrayBuffer(byteStr.length);
+              var ia = new Uint8Array(ab);
+              for (var j = 0; j < byteStr.length; j++) ia[j] = byteStr.charCodeAt(j);
+              var blob = new Blob([ab], { type: mime });
+              var file = new File([blob], 'upload.png', { type: mime });
+              var dt = new DataTransfer();
+              dt.items.add(file);
+              var pasteEvent = new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: dt
+              });
+              ed.dispatchEvent(pasteEvent);
+            } catch (e2) {}
+          }
+          return 'dispatched';
         } catch (e) { return 'error:' + e; }
       };
 
@@ -298,6 +423,13 @@ public partial class Form1
         public string ParametersJson { get; init; } = string.Empty;
     }
 
+    private sealed class ImageAttachment
+    {
+        public string MimeType { get; init; } = string.Empty;
+        public string DataUrl { get; init; } = string.Empty;
+        public string Base64 { get; init; } = string.Empty;
+    }
+
     private sealed class ChatRequestInfo
     {
         public bool Stream { get; init; }
@@ -305,6 +437,7 @@ public partial class Form1
         public string Prompt { get; set; } = string.Empty;
         public List<ToolDef> Tools { get; } = new();
         public List<string> HistoryLines { get; } = new();
+        public List<ImageAttachment> Images { get; } = new();
     }
 
     private sealed class CompletionMessage
@@ -453,7 +586,7 @@ public partial class Form1
                     return;
                 }
 
-                var raw = await ChatAsync(req.Prompt);
+                var raw = await ChatAsync(req.Prompt, req.Images);
                 var consumed = new List<string>();
                 var toolCalls = ExtractToolCalls(raw, req.Tools, consumed);
                 var content = RemoveToolCallBlocks(raw, consumed);
@@ -601,7 +734,7 @@ public partial class Form1
         return string.Empty;
     }
 
-    private async Task<string> ChatAsync(string prompt)
+    private async Task<string> ChatAsync(string prompt, List<ImageAttachment>? images = null)
     {
         if (!_ready) throw new InvalidOperationException("WebView2 尚未就绪");
 
@@ -610,7 +743,7 @@ public partial class Form1
         {
             for (var attempt = 0; ; attempt++)
             {
-                var raw = await SendOnceAsync(prompt);
+                var raw = await SendOnceAsync(prompt, images);
 
                 var limited = IsConversationLimit(raw);
                 if (!limited && string.IsNullOrWhiteSpace(raw) && IsDeepSeekPage())
@@ -625,6 +758,7 @@ public partial class Form1
                 }
 
                 await StartNewConversationAsync();
+                images = null;
             }
         }
         finally
@@ -634,7 +768,7 @@ public partial class Form1
         }
     }
 
-    private async Task<string> SendOnceAsync(string prompt)
+    private async Task<string> SendOnceAsync(string prompt, List<ImageAttachment>? images = null)
     {
         var wait = MinSendInterval - (DateTime.UtcNow - _lastSendAt);
         if (wait > TimeSpan.Zero) await Task.Delay(wait);
@@ -644,6 +778,25 @@ public partial class Form1
         _pendingCompletion = tcs;
         try
         {
+            if (images is { Count: > 0 })
+            {
+                var pasteStatus = await PasteImagesAsync(images);
+                if (pasteStatus == "paste-failed")
+                {
+                    throw new InvalidOperationException(
+                        "图片粘贴失败：剪贴板与合成 paste 均未让页面收到图片，请确认页面已就绪（chat.deepseek.com / chatgpt.com / gemini.google.com）");
+                }
+                if (pasteStatus == "no-files")
+                {
+                    throw new InvalidOperationException("图片数据解码失败，无法写入剪贴板");
+                }
+                if (pasteStatus == "no-editor")
+                {
+                    throw new InvalidOperationException(
+                        "找不到输入框，无法粘贴图片，请确认当前页面是 chat.deepseek.com、chatgpt.com 或 gemini.google.com 且已登录");
+                }
+            }
+
             var insertStatus = await OnUiAsync(async () => JsonSerializer.Deserialize<string>(
                 await webView.ExecuteScriptAsync(
                     "window.__minibrowser_send(" + JsonSerializer.Serialize(prompt) + ")")));
@@ -686,6 +839,171 @@ public partial class Form1
         {
             _pendingCompletion = null;
         }
+    }
+
+    private sealed class UploadState
+    {
+        public int Seen { get; init; }
+        public int Active { get; init; }
+        public int Pasted { get; init; }
+    }
+
+    // 真实粘贴：图片写入 Windows 剪贴板（FileDrop）→ CDP 派发 Ctrl+V → 页面按原生逻辑上传
+    private async Task<string> PasteImagesAsync(List<ImageAttachment> images)
+    {
+        var files = new List<string>();
+        foreach (var img in images)
+        {
+            var path = await SaveImageTempFileAsync(img);
+            if (path is not null) files.Add(path);
+        }
+        if (files.Count == 0) return "no-files";
+
+        var focus = await OnUiAsync(async () => JsonSerializer.Deserialize<string>(
+            await webView.ExecuteScriptAsync("window.__minibrowser_focus_editor()")));
+        if (focus is null or "no-editor" || focus.StartsWith("error")) return "no-editor";
+
+        await OnUiAsync(async () => await webView.ExecuteScriptAsync("window.__minibrowser_upload_reset()"));
+
+        var clipboardOk = await OnUiAsync(async () =>
+        {
+            try
+            {
+                var data = new DataObject();
+                data.SetData(DataFormats.FileDrop, files.ToArray());
+                Clipboard.SetDataObject(data, true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                lblService.ToolTipText = "剪贴板写入失败: " + ex.Message;
+                return false;
+            }
+        });
+
+        if (clipboardOk)
+        {
+            await OnUiAsync(async () =>
+            {
+                await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
+                    "Input.dispatchKeyEvent", CtrlVKeyDownJson);
+                await webView.CoreWebView2.CallDevToolsProtocolMethodAsync(
+                    "Input.dispatchKeyEvent", CtrlVKeyUpJson);
+            });
+        }
+
+        // trusted 粘贴成功的判据：页面收到带文件的 paste 事件，或上传已开始
+        var state = await WaitUploadStateAsync(TimeSpan.FromSeconds(3),
+            s => s.Pasted > 0 || s.Seen > 0);
+
+        if (!(state.Pasted > 0 || state.Seen > 0))
+        {
+            // 回退：合成 paste（isTrusted=false，部分站点不认）
+            var imgsJson = JsonSerializer.Serialize(
+                images.Select(i => new { mimeType = i.MimeType, dataUrl = i.DataUrl }).ToArray());
+            await OnUiAsync(async () =>
+                await webView.ExecuteScriptAsync("window.__minibrowser_paste_images(" + imgsJson + ")"));
+
+            // 合成事件一定会被自己的监听器计到 pasted，所以只有看到站点真的开始上传才算成功
+            state = await WaitUploadStateAsync(TimeSpan.FromSeconds(3), s => s.Seen > 0);
+            if (state.Seen <= 0) return "paste-failed";
+        }
+
+        // 等可能的上传开始并完成（上传中点发送会得到 ref_file_ids 为空）
+        await WaitUploadStateAsync(TimeSpan.FromSeconds(2), s => s.Active > 0);
+        await WaitUploadStateAsync(TimeSpan.FromSeconds(25), s => s.Active <= 0);
+        return "pasted";
+    }
+
+    private async Task<UploadState> WaitUploadStateAsync(TimeSpan timeout, Func<UploadState, bool> done)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        var state = await ReadUploadStateAsync();
+        while (!done(state) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(200);
+            state = await ReadUploadStateAsync();
+        }
+        return state;
+    }
+
+    private async Task<UploadState> ReadUploadStateAsync()
+    {
+        var json = await OnUiAsync(async () => await webView.ExecuteScriptAsync(
+            "window.__minibrowser_upload_state ? window.__minibrowser_upload_state() : '{}'"));
+        try
+        {
+            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(json) ? "{}" : json);
+            var root = doc.RootElement;
+            int Get(string name) =>
+                root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number
+                    ? v.GetInt32() : 0;
+            return new UploadState
+            {
+                Seen = Get("seen"),
+                Active = Get("active"),
+                Pasted = Get("pasted"),
+            };
+        }
+        catch (JsonException)
+        {
+            return new UploadState();
+        }
+    }
+
+    private static async Task<string?> SaveImageTempFileAsync(ImageAttachment img)
+    {
+        try
+        {
+            byte[] bytes;
+            string ext;
+            var dataUrl = img.DataUrl;
+
+            if (dataUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                var comma = dataUrl.IndexOf(',');
+                if (comma < 0) return null;
+                var mime = dataUrl[5..comma].Split(';')[0];
+                ext = MimeToExt(mime);
+                bytes = Convert.FromBase64String(dataUrl[(comma + 1)..]);
+            }
+            else if (Uri.TryCreate(dataUrl, UriKind.Absolute, out var uri) &&
+                     (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+            {
+                using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+                using var resp = await http.GetAsync(uri);
+                if (!resp.IsSuccessStatusCode) return null;
+                bytes = await resp.Content.ReadAsByteArrayAsync();
+                ext = MimeToExt(resp.Content.Headers.ContentType?.MediaType);
+            }
+            else
+            {
+                bytes = Convert.FromBase64String(dataUrl);
+                ext = MimeToExt(img.MimeType);
+            }
+
+            if (bytes.Length == 0) return null;
+            var dir = Path.Combine(Path.GetTempPath(), "MiniBrowser");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, "paste-" + Guid.NewGuid().ToString("N")[..10] + "." + ext);
+            await File.WriteAllBytesAsync(path, bytes);
+            return path;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string MimeToExt(string? mime)
+    {
+        var m = (mime ?? string.Empty).ToLowerInvariant();
+        if (m.Contains("jpeg") || m.Contains("jpg")) return "jpg";
+        if (m.Contains("webp")) return "webp";
+        if (m.Contains("gif")) return "gif";
+        if (m.Contains("bmp")) return "bmp";
+        if (m.Contains("svg")) return "svg";
+        return "png";
     }
 
     private async Task StartNewConversationAsync()
@@ -983,7 +1301,18 @@ public partial class Form1
                             break;
 
                         default:
-                            req.HistoryLines.Add("[user] " + MessageContent(m));
+                            // 只保留最后一条 user 消息的图片（历史图片不重复粘贴）
+                            var mtext = MessageContent(m);
+                            var imgs = MessageImages(m);
+                            req.Images.Clear();
+                            foreach (var img in imgs)
+                            {
+                                req.Images.Add(img);
+                            }
+                            if (!string.IsNullOrWhiteSpace(mtext) || imgs.Count > 0)
+                            {
+                                req.HistoryLines.Add("[user] " + mtext);
+                            }
                             break;
                     }
                 }
@@ -994,6 +1323,19 @@ public partial class Form1
                 if (!string.IsNullOrWhiteSpace(text))
                 {
                     req.HistoryLines.Add("[user] " + text);
+                }
+            }
+
+            if (root.TryGetProperty("images", out var imgsRoot) && imgsRoot.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var img in imgsRoot.EnumerateArray())
+                {
+                    var mime = GetString(img, "mimeType") ?? GetString(img, "type") ?? "image/png";
+                    var dataUrl = GetString(img, "dataUrl") ?? GetString(img, "url") ?? string.Empty;
+                    if (!string.IsNullOrEmpty(dataUrl))
+                    {
+                        req.Images.Add(new ImageAttachment { MimeType = mime, DataUrl = dataUrl });
+                    }
                 }
             }
 
@@ -1043,6 +1385,16 @@ public partial class Form1
             {
                 sb.AppendLine(line);
             }
+        }
+
+        if (req.Images.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("## 图片附件（重要）");
+            sb.AppendLine($"最新一条消息附带了 {req.Images.Count} 张图片，图片内容已经作为附件提供给你" +
+                          "（以图片信息形式呈现，即使没有独立的视觉编码器也已可读取其内容）。");
+            sb.AppendLine("你必须直接根据图片内容回答问题，可以描述、分析、对比图片。");
+            sb.AppendLine("回答时**禁止**出现“不支持图片输入”“看不到图片”“无法查看图片内容”这类说法——这是错误的，图片内容就在附件里。");
         }
 
         return sb.ToString().Trim();
@@ -1271,6 +1623,65 @@ public partial class Form1
     {
         if (el.ValueKind != JsonValueKind.Object) return null;
         return el.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+    }
+
+    private static List<ImageAttachment> MessageImages(JsonElement message)
+    {
+        var list = new List<ImageAttachment>();
+        if (!message.TryGetProperty("content", out var c) || c.ValueKind != JsonValueKind.Array)
+        {
+            return list;
+        }
+
+        foreach (var part in c.EnumerateArray())
+        {
+            if (part.ValueKind != JsonValueKind.Object) continue;
+
+            if (part.TryGetProperty("type", out var typeEl))
+            {
+                var t = typeEl.GetString();
+                if (t == "image_url")
+                {
+                    if (part.TryGetProperty("image_url", out var imgUrl) && imgUrl.ValueKind == JsonValueKind.Object)
+                    {
+                        var url = GetString(imgUrl, "url") ?? string.Empty;
+                        if (!string.IsNullOrEmpty(url))
+                        {
+                            list.Add(new ImageAttachment { DataUrl = url, MimeType = "image/*" });
+                        }
+                    }
+                }
+                else if (t == "image")
+                {
+                    var url = GetString(part, "url") ?? GetString(part, "image_url") ?? string.Empty;
+                    if (string.IsNullOrEmpty(url) && part.TryGetProperty("image_url", out var imgUrl2) && imgUrl2.ValueKind == JsonValueKind.Object)
+                    {
+                        url = GetString(imgUrl2, "url") ?? string.Empty;
+                    }
+                    if (!string.IsNullOrEmpty(url))
+                    {
+                        var mime = GetString(part, "mimeType") ?? GetString(part, "type") ?? "image/*";
+                        list.Add(new ImageAttachment { DataUrl = url, MimeType = mime });
+                    }
+                    else if (part.TryGetProperty("data", out var dataEl) && dataEl.ValueKind == JsonValueKind.String)
+                    {
+                        var mime = GetString(part, "mimeType") ?? "image/png";
+                        list.Add(new ImageAttachment { DataUrl = "data:" + mime + ";base64," + dataEl.GetString(), MimeType = mime });
+                    }
+                }
+                continue;
+            }
+
+            if (part.TryGetProperty("image_url", out var imgUrl3) && imgUrl3.ValueKind == JsonValueKind.Object)
+            {
+                var url = GetString(imgUrl3, "url") ?? string.Empty;
+                if (!string.IsNullOrEmpty(url))
+                {
+                    list.Add(new ImageAttachment { DataUrl = url, MimeType = "image/*" });
+                }
+            }
+        }
+        return list;
     }
 
     private static string MessageContent(JsonElement message)
